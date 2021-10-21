@@ -1,0 +1,1604 @@
+---
+title: "Ontogenic shifts in Symbiodiniaceae uptake of corals under various climate change scenarios
+output: html_document
+---
+
+```{r setup and package load, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#install.packages("ggplot2")
+library(ggplot2)
+#install.packages("gplots")
+library(gplots)
+#install.packages("MCMC.OTU")
+library(MCMC.OTU)
+#install.packages("ggfortify")
+library(ggfortify)
+#install.packages("cluster")
+library(cluster)
+#install.packages("labdsv")
+library(labdsv)
+#install.packages("DESeq")
+library(DESeq)
+#BiocManager::install("dada2")
+library(dada2); packageVersion("dada2"); citation("dada2")
+#BiocManager::install("phyloseq")
+library(phyloseq); packageVersion("phyloseq")
+#install.packages("ShortRead")
+library(ShortRead); packageVersion("ShortRead")
+#install.packages(vegan)
+library(vegan)
+```
+
+```{r Terminal}
+#Prior to continuing with R analysis, complete the following steps in terminal
+#Open Terminal window, navigate to folder with fastq.gz files 
+
+#Add any information to the name that is missing. In this case, add species (A-m) and timepoints (T2 only for A. milli)
+# for /r in "." %a in (*.fastq.gz) do ren "%~a" "2019-A-m-T2-%~nxa"
+
+##Not sure if the below did anything, but to include in case:
+#Also - some pre-trimming. Retain only PE reads that match amplicon primer. Remove reads containing Illumina sequencing adapters
+
+#Still in terminal, type the following:
+#ls *R1_001.fastq | cut -d '_' -f 1 > samples.list
+#for file in $(cat samples.list); do  mv ${file}_*R1*.fastq ${file}_R1.fastq; mv ${file}_*R2*.fastq ${file}_R2.fastq; done 
+#for file in $(cat samples.list); do bbduk.sh in1=${file}_R1.fastq in2=${file}_R2.fastq ref=adaptors.fasta k=12 out1=${file}_R1_NoIll.fastq out2=${file}_R2_NoIll.fastq ; done &>bbduk_NoIll.log
+#for file in $(cat samples.list); do bbduk.sh in1=${file}_R1_NoIll.fastq in2=${file}_R2_NoIll.fastq restrictleft=21 k=10 literal=GTGAATTGCAGAACTCCGTG,CCTCCGCTTACTTATATGCTT outm1=${file}_R1_NoIll_NoITS.fastq outu1=${file}_R1_check.fastq outm2=${file}_R2_NoIll_NoITS.fastq outu2=${file}_R2_check.fastq; done &>bbduk_NoITS.log
+
+#seq-tk for random subsampling of read data...to verify that A milli run is not different from G ret run
+##################For random subsampling of A milli dataset  to bring it down to G ret size
+
+#TooHighSams.list is list of A milli sample names that need to be subsampled to (7000 reads was Kate's); note s100 sets same random seed so that the same F and reverse reads are selected. In case below, re-setting random seed each time, but retaining it for both R1 and R2 processing
+#for file in $(cat TooHighSams.list); do n=$RANDOM; echo $n; seqtk sample -s $n ${file}_R1_NoIll_NoITS.fastq 7000 >${file}_R1_sub.fastq; seqtk sample -s $n ${file}_R2_NoIll_NoITS.fastq 7000 >${file}_R2_sub.fastq; done 
+#Replace original samples with these _sub files and run the analysis below as before
+```
+
+```{r DADA2 Analysis}
+#Set path to trimmed, renamed fastq files
+path <- "~/Minor Project/All2"
+fns <- list.files(path)
+fns
+
+################################
+##### Trimming/Filtering #######
+################################
+#Call in fastq files
+fastqs <- fns[grepl(".fastq$", fns)]
+fastqs <- sort(fastqs) # Sort ensures forward/reverse reads are in same order
+fnFs <- fastqs[grepl("_R1", fastqs)] # Just the forward read files
+fnRs <- fastqs[grepl("_R2", fastqs)] # Just the reverse read files
+
+
+#Get sample names, assuming files named as so: SAMPLENAME_XXX.fastq; OTHERWISE MODIFY
+sample.names <- sapply(strsplit(fnFs, "_"), `[`, 1) #the last number will select the field for renaming
+
+# Specify the full path to the fnFs and fnRs
+fnFs <- file.path(path, fnFs)
+fnRs <- file.path(path, fnRs)
+
+
+##Visualize Raw data
+#First, lets look at quality profile of R1 reads
+
+plotQualityProfile(fnFs[c(1,2,3,4)])
+plotQualityProfile(fnFs[c(107,108,109,110)])
+
+#Then look at quality profile of R2 reads
+
+
+plotQualityProfile(fnRs[c(1,2,3,4)])
+plotQualityProfile(fnRs[c(107,108,109,111)])
+
+#The reverse reads are worse quality, especially at the end, which is common in Illumina sequencing. This isn't too worrisome, DADA2 incorporates quality information into its error model which makes the algorithm more robust, but trimming as the average qualities crash is still a good idea as long as our reads will still overlap. 
+#For Pochon ITS2 primers, have 160 bp overlap. Can trim quite a bit
+
+#The distribution of quality scores at each position is shown as a grey-scale heat map, with dark colors corresponding to higher frequency. 
+#green is the mean, orange is the median, and the dashed orange lines are the 25th and 75th quantiles.
+#Recommend trimming where quality profile crashes - in this case, forward reads mostly fine up to 210; 
+#for reverse >160 bases it gets below 30; still should leave ~30-50bp overlap
+
+#If using this workflow on your own data: Your reads must still overlap after truncation in order to merge them later! If you are using a less-overlapping primer set, your truncLen must be large enough to maintain 20 + biological.length.variation nucleotides of overlap between them.
+#BUT: For common ITS amplicon strategies, it is undesirable to truncate reads to a fixed length due to the large amount of length variation at that locus. That is OK, just leave out truncLen. Make sure you removed the forward and reverse primers from both the forward and reverse reads though! 
+#Not too many indels in ITS2; at least not super long ones
+
+# Make directory and filenames for the filtered fastqs
+filt_path <- file.path(path, "trimmedSubTest")
+if(!file_test("-d", filt_path)) dir.create(filt_path)
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+
+
+##Filter
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(210,160), #leaves ~30bp overlap
+                     maxN=0, #DADA does not allow Ns
+                     maxEE=c(1,1), #allow 1 expected errors, where EE = sum(10^(-Q/10)); more conservative, model converges
+                     truncQ=2, 
+                     trimLeft=c(20,21), #N nucleotides to remove from the start of each read: ITS2 primers = F 20bp; R 21bp
+                     rm.phix=TRUE, #remove reads matching phiX genome
+                     matchIDs=TRUE, #enforce matching between id-line sequence identifiers of F and R reads
+                     compress=FALSE, multithread=FALSE) #On Windows set multithread=FALSE, MAC multithread should be TRUE
+
+head(out)
+tail(out)
+
+write.csv(out, "ALL_outreads.csv")
+
+#A word on Expected Errors vs a blanket quality threshold
+#Take a simple example: a read of length two with quality scores Q3 and Q40, corresponding to error probabilities P=0.5 
+#and P=0.0001. The base with Q3 is much more likely to have an error than the base with Q40 (0.5/0.0001 = 5,000 times 
+#more likely), so we can ignore the Q40 base to a good approximation. Consider a large sample of reads with (Q3, Q40), 
+#then approximately half of them will have an error (because of the P=0.5 from the Q2 base). We express this by saying 
+#that the expected number of errors in a read with quality scores (Q3, Q40) is 0.5.
+
+#As this example shows, low Q scores (high error probabilities) dominate expected errors, but this information is lost 
+#by averaging if low Qs appear in a read with mostly high Q scores. This explains why expected errors is a much better 
+#indicator of read accuracy than average Q.
+
+
+################################
+##### Learn Error Rates ########
+################################
+#DADA2 learns its error model from the data itself by alternating estimation of the error rates and the composition of the sample until they converge on a jointly consistent solution (this is similar to the E-M algorithm)
+#As in many optimization problems, the algorithm must begin with an initial guess, for which the maximum possible error rates in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors).
+
+
+setDadaOpt(MAX_CONSIST=30) #increase number of cycles to allow convergence
+errF <- learnErrors(filtFs, multithread=FALSE)
+#114258780 total bases in 601362 reads from 4 samples will be used for learning the error rates.
+
+errR <- learnErrors(filtRs, multithread=FALSE)
+#107580718 total bases in 773962 reads from 5 samples will be used for learning the error rates.
+
+#sanity check: visualize estimated error rates- error rates should decline with increasing qual score
+#red line is based on definition of quality score alone, black line is estimated error rate after convergence, dots are observed error rate for each quality score
+
+plotErrors(errF, nominalQ=TRUE) #some issues with C2G and G2C variants being underestimated, but not terrible
+plotErrors(errR, nominalQ=TRUE) #again, worse with G2C and C2G; a little T2G, but rest err on the side of being conservative (above red line)
+
+#why do values increase at Q40 in some plots?
+#this artefact exists b/c in many sequencing runs there are almost no Q=40 bases. The loess smoothing hits the edge and a lack of observations, causing weird behavior. BUT as there essentially aren't (almost) any Q=40 bases to correct anyway and at the worst, the error rates are overestimated, so it's actually conservative for calling new variants
+
+################################
+##### Dereplicate reads ########
+################################
+#Dereplication combines all identical sequencing reads into into "unique sequences" with a corresponding "abundance": 
+#the number of reads with that unique sequence. 
+
+#Dereplication substantially reduces computation time by eliminating redundant comparisons.
+
+#DADA2 retains a summary of the quality information associated with each unique sequence. 
+#The consensus quality profile of a unique sequence is the average of the positional qualities from the dereplicated reads. These quality profiles inform the error model of the subsequent denoising step, significantly increasing DADA2's accuracy.
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+#####################################
+##### Infer Sequence Variants #######
+#####################################
+
+#Must change some of the DADA options b/c original program optomized for ribosomal data, not ITS - from github, 
+#We currently recommend BAND_SIZE=32 for ITS data." leave as default for 16S/18S
+
+setDadaOpt(BAND_SIZE=32)
+
+dadaFs <- dada(derepFs, err=errF, multithread=FALSE)
+dadaRs <- dada(derepRs, err=errR, multithread=FALSE)
+
+#Now, look at the dada class objects by sample
+#will tell how many 'real' variants in unique input seqs
+#By default, the dada function processes each sample independently, but pooled processing is available with 
+#pool=TRUE and that may give better results for low sampling depths at the cost of increased computation time. 
+#See our discussion about pooling samples for sample inference. 
+
+dadaFs[[137]]
+dadaRs[[137]]
+
+################################
+##### Merge paired reads #######
+################################
+#To further cull spurious sequence variants, merge the denoised forward and reverse reads
+#Paired reads that do not exactly overlap are removed
+
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+
+head(mergers[[137]]) # Inspect the merger data
+summary((mergers[[137]]))
+
+#We now have a data.frame for each sample with the merged $sequence, its $abundance, and the indices of the merged $forward and $reverse denoised sequences. Paired reads that did not exactly overlap were removed by mergePairs.
+
+####################################
+##### Construct sequence table #####
+####################################
+#a higher-resolution version of the "OTU table" produced by classical methods
+
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+plot(table(nchar(getSequences(seqtab)))) #real variants appear to be right in that 294-304 window
+
+#The sequence table is a matrix with rows corresponding to (and named by) the samples, and 
+#columns corresponding to (and named by) the sequence variants. 
+#Do merged sequences all fall in the expected range for amplicons? ITS2 Pochon ~340bp-41bp primers; accept 294-304
+#Sequences that are much longer or shorter than expected may be the result of non-specific priming, and may be worth removin
+
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% seq(294,304)] #again, being fairly conservative with length
+
+table(nchar(getSequences(seqtab2)))
+dim(seqtab2)
+
+################################
+##### Remove chimeras #######
+################################
+#The core dada method removes substitution and indel errors, but chimeras remain. 
+#Fortunately, the accuracy of the sequences after denoising makes identifying chimeras easier 
+#than it is when dealing with fuzzy OTUs: all sequences which can be exactly reconstructed as 
+#a bimera (two-parent chimera) from more abundant sequences.
+
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=FALSE, verbose=TRUE)
+#Identified 2536 bimeras out of 3324 input sequences.
+dim(seqtab.nochim)
+#137 788
+
+sum(seqtab.nochim)/sum(seqtab2)
+#0.9616387
+
+#The fraction of chimeras varies based on factors including experimental procedures and sample complexity, 
+#but can be substantial. Here chimeras make up about 36% of the inferred sequence variants (138-89 = 49 => 49/138), 
+#BUT those variants account for only about 0.5% of the total sequence reads
+#Most of your reads should remain after chimera removal (it is not uncommon for a majority of sequence variants to be 
+#removed though)
+
+
+################################
+##### Track Read Stats #######
+################################
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(mergers, getN), rowSums(seqtab2), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoised", "merged", "tabled", "nonchim")
+rownames(track) <- sample.names
+head(track)
+tail(track) 
+
+write.csv(track,file="ReadFilterStatsAll.csv",row.names=TRUE,quote=FALSE)
+
+
+################################
+##### Assign Taxonomy #######
+################################
+
+#It is common at this point, especially in 16S/18S/ITS amplicon sequencing, to classify sequence variants taxonomically. 
+#DADA2 provides a native implementation of the RDP's naive Bayesian classifier. The assignTaxonomy function takes a set of sequences and a training set of taxonomically classified sequences, and outputs the taxonomic assignments with at least minBoot bootstrap confidence.
+#Here, I have supplied a modified version of the GeoSymbio ITS2 database (Franklin et al. 2012)
+taxa <- assignTaxonomy(seqtab.nochim, "~/Minor Project/Project/Bioinformatics/Analyses/GeoSymbio_ITS2_LocalDatabase_verForPhyloseq.fasta", minBoot=5,multithread=FALSE,tryRC=TRUE,outputBootstraps=FALSE)
+unname(head(taxa, 30))
+unname(taxa)
+
+#Lowered bootstrap threshold from 50 to 5. Was not returning hits for many sequences. But reducing to 5 improved sequence return and identities largely match separate blastn search against the same database
+
+#Now, save outputs so can come back to the analysis stage at a later point if desired
+saveRDS(seqtab.nochim, file="All_seqtab_nochim.rds") 
+saveRDS(taxa, file="All_taxa_blastCorrected.rds")
+
+#If you need to read in previously saved datafiles
+seqtab.nochim <- readRDS("All_seqtab_nochim.rds")
+taxa <-readRDS("All_taxa_blastCorrected.rds")
+
+
+#Lowered bootstrap threshold from 50 to 5. Was not returning hits for many sequences. But reducing to 5 improved sequence return and identities largely match separate blastn search against the same database
+
+#Now, save outputs so can come back to the analysis stage at a later point if desired
+saveRDS(seqtab.nochim, file="All_seqtab_nochim.rds")
+saveRDS(taxa, file="All_taxa_blastCorrected.rds")
+```
+
+```{r Back to terminal}
+#back in terminal, run blast against Symbio database to compare
+#makeblastdb -in GeoSymbio_ITS2_LocalDatabase.fasta -dbtype nucl
+#blastn -query OTUs_All.fasta -db Users/alyxt/Documents/Minor Project/All2/GeoSymbio_ITS2_LocalDatabase.fasta -num_descriptions 5 -num_alignments 5 -out NODES_All.br
+#grep -A 12 'Query=' NODES_All.br
+
+##########################
+####using LULU to collapse intragenomic variants if present
+####Problem: co-occurrence of ASVs across samples is expected for this dataset! We're  
+####looking at heritability of symbionts in parents and eggs.
+####therefore, just use co-occurrence in independent adult coral samples across years  
+####to remove highly sequence similar, co-occurring ITS2 types, if present
+############
+
+#######IN TERMINAL#########
+
+#First produce a blastdatabase with the ASVs
+#makeblastdb -in Sep21_OTUs_All.fasta -parse_seqids -dbtype nucl
+
+# Then blast the ASVs against the database to produce the match list
+# which provides information about sequence similarity for collapsing
+# ITS2 diversity 
+#blastn -db Sep21_OTUs_All.fasta -outfmt '6 qseqid sseqid pident' -out match_list.txt -qcov_hsp_perc 90 -perc_identity 84 -query Sep21_OTUs_All.fasta
+```
+
+```{r phyloseq setup (ps)}
+
+samdf<-read.csv("sampleinfoALL.csv")
+head(samdf)
+rownames(samdf) <- samdf$sample.name
+
+rownames(taxa)<-colnames(seqtab.nochim)
+# Construct phyloseq object (straightforward from dada2 outputs)
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa))
+ps
+
+```
+
+```{r Alpha and Beta Diversity plots}
+###Notes####
+#Visualize alpha-diversity - ***Should be done on raw, untrimmed dataset***
+#total species diversity in a landscape (gamma diversity) is determined by two different things, the mean species diversity in sites or habitats at a more local scale (alpha diversity) and the differentiation among those habitats (beta diversity)
+#Shannon:Shannon entropy quantifies the uncertainty (entropy or degree of surprise) associated with correctly predicting which letter will be the next in a diverse string. Based on the weighted geometric mean of the proportional abundances of the types, and equals the logarithm of true diversity. When all types in the dataset of interest are equally common, the Shannon index hence takes the value ln(actual # of types). The more unequal the abundances of the types, the smaller the corresponding Shannon entropy. If practically all abundance is concentrated to one type, and the other types are very rare (even if there are many of them), Shannon entropy approaches zero. When there is only one type in the dataset, Shannon entropy exactly equals zero (there is no uncertainty in predicting the type of the next randomly chosen entity).
+#Simpson:equals the probability that two entities taken at random from the dataset of interest represent the same type. equal to the weighted arithmetic mean of the proportional abundances pi of the types of interest, with the proportional abundances themselves being used as the weights. Since mean proportional abundance of the types increases with decreasing number of types and increasing abundance of the most abundant type, λ obtains small values in datasets of high diversity and large values in datasets of low diversity. This is counterintuitive behavior for a diversity index, so often such transformations of λ that increase with increasing diversity have been used instead. The most popular of such indices have been the inverse Simpson index (1/λ) and the Gini–Simpson index (1 − λ).
+####Plots#####
+#Currently using ps2, which is the filtered data removing samples with low quality read counts
+
+#Plot richnes by Treatment
+plot_richness(ps2, x="Treatment", measures = c("Shannon", "Simpson"), color="TimePoint", title="Treatment Diversity") + theme_bw()
+plot_richness(ps2, x="Treatment", measures = c("Shannon", "Simpson"), color="Species", title="Treatment Diversity") + theme_bw()
+
+#Plot richness by Time
+plot_richness(ps2, x="TimePoint", measures = c("Shannon", "Simpson"), color="Treatment", title="Time Diversity") + theme_bw() 
+plot_richness(ps2, x="TimePoint", measures = c("Shannon", "Simpson"), color="Species", title="Time Diversity") + theme_bw() 
+
+#Plot richness by Species
+plot_richness(ps2, x="Species", measures = c("Shannon", "Simpson"), color="Treatment", title="Species Diversity") + theme_bw()
+
+
+
+#PROPER plots
+#Treatment
+sample_data(ps2)$Treatment <- factor((sample_data(ps2)$Treatment), levels=c("2020","2050","2100"))
+
+plot_richness(ps2, x="Treatment", measures="Shannon", color = "TimePoint")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="right", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))
+
+#Time Point
+sample_data(ps2)$TimePoint <- factor((sample_data(ps2)$TimePoint), levels=c("T0","T1","T2"))
+
+plot_richness(ps2, x="TimePoint", measures="Shannon", color = "Treatment")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="right", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))
+
+#Species
+sample_data(ps2)$Species <- factor((sample_data(ps2)$Species), levels=c("A. millepora","G. retiformis"))
+
+plot_richness(ps2, x="Species", measures="Shannon", color = "Species")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="right", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))
+
+#Add comparisons between pairs of groups
+#Treatment
+a_my_comparisons <- list( c("2020", "2050"), c("2020", "2100"), c("2050", "2100"))
+symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "ns"))
+
+plot_richness(ps2, x="Treatment", measures="Shannon", color = "Species")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="none", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))+
+  stat_compare_means(method = "wilcox.test", comparisons = a_my_comparisons, label = "p.signif", symnum.args = symnum.args)
+
+#TimePoint
+b_my_comparisons <- list( c("T0", "T1"), c("T0", "T2"), c("T1", "T2"))
+symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "ns"))
+
+plot_richness(ps2, x="TimePoint", measures="Shannon", color = "TimePoint")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="none", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))+
+  stat_compare_means(method = "wilcox.test", comparisons = b_my_comparisons, label = "p.signif", symnum.args = symnum.args)
+
+#Species
+c_my_comparisons <- list( c("A. millepora", "G. retiformis"))
+symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "ns"))
+
+plot_richness(ps2, x="Species", measures="Shannon", color = "Species")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="none", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))+
+  stat_compare_means(method = "wilcox.test", comparisons = c_my_comparisons, label = "p.signif", symnum.args = symnum.args)
+
+#Plot Treat and Time
+plot_richness(ps2, x="Treatment", measures="Shannon", color = "Species")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="none", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))+
+  stat_compare_means(method = "wilcox.test", comparisons = a_my_comparisons, label = "p.signif", symnum.args = symnum.args)+
+  stat_compare_means(method = "wilcox.test", comparisons = c_my_comparisons, label = "p.signif", symnum.args = symnum.args)
+
+plot_richness(ps2, x="TimePoint", measures="Shannon", color = "Species")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="right", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))+
+  stat_compare_means(method = "wilcox.test", comparisons = b_my_comparisons, label = "p.signif", symnum.args = symnum.args)+
+  stat_compare_means(method = "wilcox.test", comparisons = c_my_comparisons, label = "p.signif", symnum.args = symnum.args)
+
+
+#Histogram to measure for distribution
+richness<-estimate_richness(ps2, measures = "Shannon")
+hist(richness$Shannon, main = "Shannon Index", xlab = "") #It is
+
+
+#Run anova test to check if variables impact diversity
+#Treatment
+anova.sh=aov(richness$Shannon~sample_data(ps2)$Treatment)
+summary(anova.sh) # sig
+#Time
+anova.time=aov(richness$Shannon~sample_data(ps2)$TimePoint)
+summary(anova.time) #significant
+#Species
+anova.sp=aov(richness$Shannon~sample_data(ps2)$Species)
+summary(anova.sp) #significant
+
+#Tukey to test for differences
+TukeyHSD(anova.time) #T1-T0 and T2-T1
+TukeyHSD(anova.sp)
+TukeyHSD(anova.sh) #2100-2020 and 2100-2050
+
+
+##Now again with relative abundance
+
+richnessrel<-estimate_richness(psrel, measures = "Shannon")
+hist(richness$Shannon, main = "Shannon Index", xlab = "") #It is
+
+#Run anova test to check if variables impact diversity
+#Treatment
+anova.relsh=aov(richnessrel$Shannon~sample_data(psrel)$Treatment)
+summary(anova.relsh) #not sig
+#Time
+anova.reltime=aov(richnessrel$Shannon~sample_data(psrel)$TimePoint)
+summary(anova.reltime) #significant
+#Species
+anova.relsp=aov(richnessrel$Shannon~sample_data(psrel)$Species)
+summary(anova.relsp) #significant
+
+#Tukey to test for differences
+TukeyHSD(anova.reltime) #T1-T0 and T2-T1, not T2-T0
+
+####Merged samples by Treatment###
+psmerge=merge_samples(ps2, "Treatment")
+plot_richness(psmerge,x="Treatment", color="TimePoint", measures =c("Shannon", "Simpson"), title="Merged Treatment Diversity")+ theme_bw()
+##Diversity highest in 2020, lowest in 2050
+
+##Merged samples by Time
+psmerge=merge_samples(ps2, "TimePoint")
+plot_richness(psmerge, x="TimePoint", color = "Species", measures=c("Shannon", "Simpson")) + geom_point(size=12, alpha=0.7)
+
+##Merged samples by Species
+psmerge=merge_samples(ps2, "Species")
+plot_richness(psmerge, x="Species", color = "TimePoint", measures=c("Shannon", "Simpson")) + geom_point(size=12, alpha=0.7)
+
+##Ordinate Samples
+ord.nmds.bray2<-ordinate(ps2,method="NMDS",distance="bray",zerodist="ignore", k=20)
+
+#Export goods3 for Diversity calcs in Excel
+write.csv(goods3,"Diversity_all.csv")
+```
+
+```{r OTU table}
+#seqtab.nochim is the 'OTU' table...but is a little unwieldy
+#For Symbiodinium, sequence classification is not so great...
+#want fasta file of 'OTUs' and table designated by 'OTU'
+
+#First, output fasta file for 'OTUs'
+path='~/All2'
+uniquesToFasta(seqtab.nochim, path, ids = NULL, mode = "w", width = 20000)
+
+#then, rename output table and write it out
+ids <- paste0("sq", seq(1, length(colnames(seqtab.nochim))))
+colnames(seqtab.nochim)<-ids
+
+write.csv(seqtab.nochim,file="All_OutputDADA_AllOTUs.csv",quote=F)
+
+str(seqtab.nochim)
+```
+
+```{r Filter Zeros (create ps2)}
+#alldat
+alldat<-read.csv("ALL_OutputDADA_AllOTUs.csv")
+names(alldat)
+str(alldat)
+head(alldat)
+#Some samples have no remaining reads
+
+#Find rows with no remaining reads
+rowsums<-rowSums(alldat[2:789])
+###Rows with no reads left: 49, 51 (2019-G-r-T0-7M3-1-1, 2019-G-r-T0-8A3-1-1)
+###Need to remove these rows/samples
+dat<-alldat[c(1:48,50,52:137),] #removes 49, 51
+colnames(dat)[colnames(dat)=="X"]<-"Samplename" #Changed first column title to Samplename
+
+props=apply(dat[,c(2:789)],2,function(x){sum(x)/sum(dat[,c(2:789)])})
+tdat<-as.data.frame(t(dat[2:789]))
+tdat$zeros=apply(tdat,1,function(x){sum(x<1)}) #making new column counting number of samples with counts <=1 within each isogroup (host)
+tdat$low=tdat$zeros/135 #new column with fraction of zeros to total
+
+#purging under-sequenced samples; and ASVs represented less than 3 unique times
+goods2=purgeOutliers(dat,count.columns=2:789,otu.cut=0,zero.cut=0.022) #cols=2:789; zero cut=0.022
+#152 OTUs with counts in 0.022 (3/135) of samples (TRUE)
+#636 OTUS without counts in 0.022 (3/135) of samples (FALSEO)
+
+
+taxa_names(ps)<-names(dat)[2:789]
+
+#Now, to change ps to remove samples
+ps2<-prune_samples(sample_data(ps)$sample.name %in% goods2$cdat, ps)
+
+
+#Assess distribution of taxa (histogram)
+ps2_taxa<-data.table(tax_table(ps2),
+                          ASVabundance = taxa_sums(ps2),
+                          ASV = taxa_names(ps2))
+
+ps2_tax_plot <- ggplot(ps2_taxa, aes(ASVabundance)) +
+  geom_histogram() + ggtitle("Histogram of ASVs (unique sequence) counts") +
+  theme_bw() + scale_x_log10() + ylab("Frequency of ASVs") + xlab("Abundance (raw counts)")
+
+print(ps2_tax_plot)
+
+plot_taxa_prevalence(ps2, "Phylum")
+
+
+```
+
+```{r PCoA}
+# creating a log-transfromed normalized dataset for PCoA:
+goods.log=logLin(data=goods2,count.columns =2:length(names(goods2)))
+#add 1 to goods2 for logLin
+rownames(goods2)<-goods2$cdat
+goods3=1+goods2[c(1:135),c(2:153)]
+goods.log1=logLin(data=goods3,count.columns =2:length(names(goods3)))
+                 
+rownames(goods.log1)<-goods2$cdat
+
+#replace phyloseq ASV table with logLin transform
+OTU<-otu_table(goods.log1,taxa_are_rows=FALSE)
+#otu_table(ps2)<-OTU
+
+
+#plot PCoA
+ord<-ordinate(ps2,"PCoA","manhattan", na.rm = TRUE) #not used
+#require(gridExtra) #not used
+
+plot_scree(ord)
+p1=plot_ordination(ps2,ord,type="taxa",color="Phylum", title="PCoA of Clade Types")
+p1
+p1+facet_wrap(~Phylum, 3)
+
+p2=plot_ordination(ps2,ord,type="samples",color="TimePoint",shape="TimePoint", title="PCoA of clades across time points")+geom_point(size=3,alpha=0.75)+scale_colour_brewer(type="qual",palette="Set2")
+p2+facet_wrap(~TimePoint, 3)
+p2+facet_wrap(~Treatment, 3)
+p2+facet_wrap(~Species, 3)
+unname(taxa)
+```
+
+```{r Bar Plots}
+##Exploratory bar-plots
+
+#ps2
+
+#Top 3 
+top3<-names(sort(taxa_sums(ps2),decreasing = TRUE))[1:3]
+ps.top3<-transform_sample_counts(ps2,function(OTU) OTU/sum(OTU))
+ps.top3<-prune_taxa(top3,ps.top3)
+
+plot_bar(ps.top3, x="Phylum", fill="Class") + facet_wrap(~Species, scales="free_x") + labs (x="Clade", fill="Type")
+plot_bar(ps.top3, x="Phylum", fill="Class") + facet_wrap(~Species+TimePoint+Treatment, scales="free_x") + labs (x="Clade", fill="Type")
+plot_bar(ps.top3, x="Phylum", fill="Class") + facet_wrap(~TimePoint+Species, scales="free_x") + labs (x="Clade", fill="Type")
+
+#Top 30 using ps2, which is corrected samples
+top30<-names(sort(taxa_sums(ps2),decreasing = TRUE))[1:30]
+ps.top30<-transform_sample_counts(ps2,function(OTU) OTU/sum(OTU))
+ps.top30<-prune_taxa(top30,ps.top30)
+
+plot_bar(ps.top30, x="Phylum", fill="Class")+ labs (x="Clade", fill="Type")
+
+#Grouped by clade
+plot_bar(ps.top30, x="Phylum", fill="Class") + facet_wrap(~Treatment+TimePoint, scales="free_x") + labs (x="Clade", fill="Type")
+
+#Grouped by species
+plot_bar(ps.top30, x="Phylum", fill="Class") + facet_wrap(~Species, scales="free_x") + labs (x="Clade", fill="Type")
+plot_bar(ps.top30, x="Phylum", fill="Class") + facet_wrap(~Treatment+TimePoint+Species, scales="free_x") + labs (x="Clade", fill="Type")
+plot_bar(ps.top30, x="Phylum", fill="Class") + facet_wrap(~Species+TimePoint, scales="free_x") + labs (x="Clade", fill="Type")
+#Really cool - G. ret way more D - account for number of samples though? - With timepoint, we see there is a small difference
+
+#Bottom 30 using ps2
+btm30<-names(sort(taxa_sums(ps2), decreasing = FALSE))[1:30]
+ps.btm30<-transform_sample_counts(ps2,function(OTU) OTU/sum(OTU))
+ps.btm30<-prune_taxa(btm30,ps.btm30)
+plot_bar(ps.btm30,x="Phylum", fill="Class") + facet_wrap(~Treatment+TimePoint, scales="free_x") + labs (x="Clade", fill="Type")
+
+#Unique
+unique603<-names(sort(taxa_sums(ps2), decreasing = FALSE))[1:603]
+ps.unique<-transform_sample_counts(ps,function(OTU) OTU/sum(OTU))
+ps.unique<-prune_taxa(unique603,ps.unique)
+plot_bar(ps.unique,x="Phylum", fill="Class") + facet_wrap(~Treatment+TimePoint+Species, scales="free_x") + labs (x="Clade", fill="Type")
+plot_bar(ps.unique,x="Phylum", fill="Class") + facet_wrap(~Treatment, scales="free_x") + labs (x="Clade", fill="Type")
+
+plot_bar(ps.unique,x="Phylum", fill="Type") + facet_wrap(~TimePoint, scales="free_x") + labs (x="Clade", fill="Phylum")
+
+#Grouped by Species
+plot_bar(ps.btm30,x="Phylum", fill="Class") + facet_wrap(~Treatment+TimePoint+Species, scales="free_x") + labs (x="Clade", fill="Type")
+
+#Ranked All
+top<-names(sort(taxa_sums(ps2), decreasing = TRUE))
+ps.all<-transform_sample_counts(ps2,function(OTU) OTU/sum(OTU))
+ps.all<-prune_taxa(top,ps.all)
+plot_bar(ps.all,x="Phylum", fill="Class") + facet_wrap(~Treatment+TimePoint, scales="free_x") + labs (x="Clade", fill="Type")
+
+#By Species
+plot_bar(ps.all,x="Phylum", fill="Class") + facet_wrap(~Treatment+TimePoint+Species, scales="free_x") + labs (x="Clade", fill="Type")
+
+
+##Other ordination
+top.class=sort(tapply(taxa_sums(ps2), tax_table(ps2)[,"Phylum"], sum), TRUE)
+top.types=sort(tapply(taxa_sums(ps2), tax_table(ps2)[,"Class"], sum), TRUE)
+top.prune=subset_taxa(ps2, Phylum %in% names(top.class))
+get_taxa_unique(ps2, "Class")
+
+
+CCA.plot.Treatment<-plot_ordination(ps2, ordinate(ps2, "CCA"), type="samples", color="Treatment")
+CCA.plot.Treatment
+
+CCA.plot.TimePoint<-plot_ordination(psrel, ordinate(psrel, "CCA"), type="samples", color="TimePoint")
+CCA.plot.TimePoint
+
+CCA.plot.Species<-plot_ordination(psrel, ordinate(psrel, "CCA"), type="samples", color="Species")
+CCA.plot.Species
+
+CCA.plot.Both<-plot_ordination(psrel, ordinate(psrel, "CCA"), type="samples", color="Treatment", shape="TimePoint")
+CCA.plot.Both
+
+
+##NMDS
+ord.nmds1<-ordinate(ps2, method = "NMDS", distance="jaccard")
+
+ord.nmds1
+
+plot_ordination(ps2, ord.nmds1, color="Treatment", shape = "Species")+geom_point(size=3)
+
+nmds.score<-scores(ord.nmds1, display = "species")
+
+##Plot heat map
+plot_heatmap(t2, method="NMDS", distance="bray")
+plot_heatmap(psrel, method="NMDS", distance="bray")
+```
+
+```{r DESeq}
+#load deseq
+
+#must swap rows/columns to match DESeq format
+
+head(goods3)
+rownames(goods3)<-goods2$cdat
+names(goods3)
+
+counts<-data.frame(t(goods3[,1:152])) #5:38 only the columns with count data
+
+conditions<-samdf[c(1:48,50,52:137),2:5] #25, 57 (2019-G-r-T0-7M3-1-1, 2019-G-r-T0-8A3-1-1) removed
+head(conditions)
+```
+
+```{r Build DESeq object (realdds)}
+#Build DESeq object
+realdds=newCountDataSet(counts,conditions)
+realdds=estimateSizeFactors(realdds)
+sizeFactors(realdds)
+realdds=estimateDispersions(realdds, method="blind", fitType="local")
+#realdds=estimateDispersions(realdds, sharingMode="gene-est-only", method="blind", fitType="local")
+
+
+goodsdds=t(counts(realdds,normalized=TRUE))
+#The proportion of samples with ASVs
+withDatagoodsdds<-apply(goodsdds,2,function(x){sum(x>0)/length(x)})
+
+hist(withDatagoodsdds)
+
+
+#percentage of total counts each ASV represents
+propsgoodsdds<-apply(goodsdds,2,function(x){sum(x)/sum(goodsdds)})
+
+barplot(propsgoodsdds)
+#props#: sq1=40%, sq2=22%, sq3=12%, sq4=4%, sq5=1%
+
+cds<-estimateDispersions(realdds, method = "blind", fitType="local")
+vsd.cds<-varianceStabilizingTransformation(cds)
+
+vsd<-getVarianceStabilizedData(realdds)
+normal<-counts(realdds, normalized=TRUE)
+```
+
+```{r model testing (fits)}
+fit0=fitNbinomGLMs(realdds, count~Treatment, glmControl=list(maxit=100))
+fit1=fitNbinomGLMs(realdds, count~TimePoint, glmControl=list(maxit=100))
+fit2=fitNbinomGLMs(realdds, count~Species, glmControl=list(maxit=100))
+
+fit3=fitNbinomGLMs(realdds,count~Treatment+TimePoint, glmControl=list(maxit=100))
+fit4=fitNbinomGLMs(realdds,count~Treatment+Species, glmControl=list(maxit=100))
+fit5=fitNbinomGLMs(realdds,count~TimePoint+Species, glmControl=list(maxit=100))
+fit6=fitNbinomGLMs(realdds,count~TimePoint+Treatment+Species, glmControl=list(maxit=100))
+
+fit6=fitNbinomGLMs(realdds,count~Treatment*TimePoint, glmControl=list(maxit=100))
+fit7=fitNbinomGLMs(realdds,count~Species+Treatment*TimePoint, glmControl=list(maxit=100))
+fit8=fitNbinomGLMs(realdds,count~Species*Treatment*TimePoint, glmControl=list(maxit=100))
+  
+pvals.tr<-nbinomGLMTest(fit3,fit0)#significance of Treatment term (Treatment+Time:Treatment)
+pvals.ti<-nbinomGLMTest(fit3,fit1)#significance of Time term (TimePoint+Treatment:TimePoint)
+pvals.sp<-nbinomGLMTest(fit6, fit2)#significance of Species term (Species+TimePoint+Treatment:Species) 
+
+pvals.sptr<-nbinomGLMTest(fit4, fit2)#significance of Species term vs Treatment (Species+TimePoint+Treatment:Species) 
+pvals.spti<-nbinomGLMTest(fit5, fit2)#significance of Species term vs Time (Species+TimePoint+Treatment:Species) 
+
+pvals.inttt<-nbinomGLMTest(fit6,fit3)#Significance of interaction of JUST Treatment and Time term (TimePoint*Treatment:TimePoint+Treatment)
+pvals.intall1<-nbinomGLMTest(fit8,fit7)#Significance of interaction with added species term (Species*TimePoint*Treatment:Species*TimePoint+Treatment)
+pvals.intall2<-nbinomGLMTest(fit8,fit6)#Significance of interaction term with all(Species*TimePoint*Treatment:Species+TimePoint+Treatment)
+```
+
+```{r adjust for multiple testing}
+#time
+adjp.ti<-p.adjust(pvals.ti,method="BH")
+adjp.ti=data.frame(adjp.ti)
+pvals.ti<-data.frame(pvals.ti)
+
+converged.ti<-as.data.frame(cbind(fit1$converged,fit3$converged))
+converged.ti$test<-converged.ti$V1+converged.ti$V2
+
+adjp.ti=data.frame(adjp.ti)
+pvals.ti<-data.frame(pvals.ti)
+
+rownames(fit3)->rownames(pvals.ti); rownames(fit3)->rownames(converged.ti);rownames(fit3)->rownames(adjp.ti);
+converged.ti$test<-apply(converged.ti,1,all)
+badmods.ti<-subset(converged.ti,(!converged.ti$test))
+for ( i in rownames(badmods.ti)){pvals.ti[i,1]<-NA}
+for ( i in rownames(badmods.ti)){adjp.ti[i,1]<-NA}
+
+#treatment
+adjp.tr<-p.adjust(pvals.tr,method="BH")
+adjp.tr=data.frame(adjp.tr)
+pvals.tr<-data.frame(pvals.tr)
+
+converged.tr<-as.data.frame(cbind(fit0$converged,fit3$converged))
+converged.tr$test<-converged.tr$V1+converged.tr$V2
+
+rownames(fit3)->rownames(pvals.tr); rownames(fit3)->rownames(converged.tr);rownames(fit3)->rownames(adjp.tr);
+converged.tr$test<-apply(converged.tr,1,all)
+badmods.tr<-subset(converged.tr,(!converged.tr$test))
+for ( i in rownames(badmods.tr)){pvals.tr[i,1]<-NA}
+for ( i in rownames(badmods.tr)){adjp.ti[i,1]<-NA}
+
+#species
+adjp.sp<-p.adjust(pvals.sp,method="BH")
+adjp.sp=data.frame(adjp.sp)
+pvals.sp<-data.frame(pvals.sp)
+
+converged.sp<-as.data.frame(cbind(fit2$converged,fit6$converged))
+converged.sp$test<-converged.sp$V1+converged.sp$V2
+
+rownames(fit6)->rownames(pvals.sp); rownames(fit6)->rownames(converged.sp);rownames(fit6)->rownames(adjp.sp);
+converged.sp$test<-apply(converged.sp,1,all)
+badmods.sp<-subset(converged.sp,(!converged.sp$test))
+for ( i in rownames(badmods.sp)){pvals.sp[i,1]<-NA}
+for ( i in rownames(badmods.sp)){adjp.sp[i,1]<-NA}
+
+#species and treatment
+adjp.sptr<-p.adjust(pvals.sptr,method="BH")
+adjp.sptr=data.frame(adjp.sptr)
+pvals.sptr<-data.frame(pvals.sptr)
+
+converged.sptr<-as.data.frame(cbind(fit2$converged,fit4$converged))
+converged.sptr$test<-converged.sptr$V1+converged.sptr$V2
+
+rownames(fit4)->rownames(pvals.sptr); rownames(fit4)->rownames(converged.sptr);rownames(fit6)->rownames(adjp.sptr);
+converged.sptr$test<-apply(converged.sptr,1,all)
+badmods.sptr<-subset(converged.sptr,(!converged.sptr$test))
+for ( i in rownames(badmods.sptr)){pvals.sptr[i,1]<-NA}
+for ( i in rownames(badmods.sptr)){adjp.sptr[i,1]<-NA}
+
+#species and time
+adjp.spti<-p.adjust(pvals.spti,method="BH")
+adjp.spti=data.frame(adjp.spti)
+pvals.spti<-data.frame(pvals.spti)
+
+converged.spti<-as.data.frame(cbind(fit2$converged,fit6$converged))
+converged.spti$test<-converged.spti$V1+converged.spti$V2
+
+rownames(fit6)->rownames(pvals.spti); rownames(fit6)->rownames(converged.spti);rownames(fit6)->rownames(adjp.spti);
+converged.spti$test<-apply(converged.spti,1,all)
+badmods.spti<-subset(converged.spti,(!converged.spti$test))
+for ( i in rownames(badmods.spti)){pvals.spti[i,1]<-NA}
+for ( i in rownames(badmods.spti)){adjp.spti[i,1]<-NA}
+
+#interaction time and treatment
+adjp.inttt<-p.adjust(pvals.inttt,method="BH")
+
+adjp.inttt=data.frame(adjp.inttt)
+pvals.inttt<-data.frame(pvals.inttt)
+
+converged.inttt<-as.data.frame(cbind(fit2$converged,fit4$converged))
+converged.inttt$test<-converged.inttt$V1+converged.inttt$V2
+
+rownames(fit4)->rownames(pvals.inttt); rownames(fit4)->rownames(converged.inttt);rownames(fit4)->rownames(adjp.inttt);
+converged.inttt$test<-apply(converged.inttt,1,all)
+badmods.inttt<-subset(converged.inttt,(!converged.inttt$test))
+for ( i in rownames(badmods.inttt)){pvals.inttt[i,1]<-NA}
+for ( i in rownames(badmods.inttt)){adjp.inttt[i,1]<-NA}
+
+#interaction species + time and treatment
+adjp.intall1<-p.adjust(pvals.intall1,method="BH")
+
+adjp.intall1=data.frame(adjp.intall1)
+pvals.intall1<-data.frame(pvals.intall1)
+
+converged.intall1<-as.data.frame(cbind(fit7$converged,fit8$converged))
+converged.intall1$test<-converged.intall1$V1+converged.intall1$V2
+
+rownames(fit8)->rownames(pvals.intall1); rownames(fit8)->rownames(converged.intall1);rownames(fit8)->rownames(adjp.intall1);
+converged.intall1$test<-apply(converged.intall1,1,all)
+badmods.intall1<-subset(converged.intall1,(!converged.intall1$test))
+for ( i in rownames(badmods.intall1)){pvals.intall1[i,1]<-NA}
+for ( i in rownames(badmods.intall1)){adjp.intall1[i,1]<-NA}
+
+#interaction species and time and treatment
+adjp.intall2<-p.adjust(pvals.intall2,method="BH")
+
+adjp.intall2=data.frame(adjp.intall2)
+pvals.intall2<-data.frame(pvals.intall2)
+
+converged.intall2<-as.data.frame(cbind(fit6$converged,fit8$converged))
+converged.intall2$test<-converged.intall2$V1+converged.intall2$V2
+
+rownames(fit8)->rownames(pvals.intall2); rownames(fit8)->rownames(converged.intall2);rownames(fit8)->rownames(adjp.intall2);
+converged.intall2$test<-apply(converged.intall2,1,all)
+badmods.intall2<-subset(converged.intall2,(!converged.intall2$test))
+for ( i in rownames(badmods.intall2)){pvals.intall2[i,1]<-NA}
+for ( i in rownames(badmods.intall2)){adjp.intall2[i,1]<-NA}
+
+
+summary(adjp.sp)
+#Mean: 0.485850
+#Median: 0.471206
+#Range: 0-1
+#NAs 8
+summary(adjp.tr)
+#Mean: 0.32467
+#Median: 0.13416 
+#Range: 0-1
+#NAs 4
+summary(adjp.ti)
+#Mean: 0.40313
+#Median: 0.32448
+#Range: 0-1
+#NAs: 15
+summary(adjp.sptr)
+#Mean: 0.342171
+#Median: 172124
+#Range: 0-1
+#NAs: 14
+summary(adjp.spti)
+#Mean: 0.36674
+#Median: 0.18639
+#Range: 0-1
+#NAs: 18
+summary(adjp.inttt)
+#Mean: 0.8683  
+#Median: 1
+#Range: 0-1
+#NAs: 16
+summary(adjp.intall1)
+#Mean: 0.8443
+#Median: 0.8102
+#Range: 0.8102
+#NAs: 19
+summary(adjp.intall2)
+#Mean: 0.358903
+#Median: 0.322772
+#Range: 0.000115-1
+#NAs: 19
+
+#create table of all multiple test corrected p-values with variance stabilized count data
+#run these first
+PPV_VSD_corrected2<-cbind(vsd, "adjp.tr" = adjp.tr$adjp.tr, "adjp.ti" = adjp.ti$adjp.ti,"adjp.sp" = adjp.sp$adjp.sp,"adjp.sptr" = adjp.sptr$adjp.sptr, "adjp.spti" = adjp.spti$adjp.spti, "adjp.inttt" = adjp.inttt$adjp.inttt, "adjp.intall1" = adjp.intall1$adjp.intall1, "adjp.intall2" = adjp.intall2$adjp.intall2, "pvals.tr" = pvals.tr$pvals.tr, "pvals.ti" = pvals.ti$pvals.ti, "pvals.sp" = pvals.sp$pvals.sp, "pvals.sptr" = pvals.sptr$pvals.sptr,  "pvals.spti" = pvals.spti$pvals.spti, "pvals.inttt" = pvals.inttt$pvals.inttt, "pvals.intall1" = pvals.intall1$pvals.intall1, "pvals.intall2" = pvals.intall2$pvals.intall2)  
+
+PPV_Norm_corrected2<-cbind(normal, "adjp.tr" = adjp.tr$adjp.tr, "adjp.ti" = adjp.ti$adjp.ti,"adjp.sp" = adjp.sp$adjp.sp,"adjp.sptr" = adjp.sptr$adjp.sptr, "adjp.spti" = adjp.spti$adjp.spti, "adjp.inttt" = adjp.inttt$adjp.inttt, "adjp.intall1" = adjp.intall1$adjp.intall1, "adjp.intall2" = adjp.intall2$adjp.intall2, "pvals.tr" = pvals.tr$pvals.tr, "pvals.ti" = pvals.ti$pvals.ti, "pvals.sp" = pvals.sp$pvals.sp, "pvals.sptr" = pvals.sptr$pvals.sptr,  "pvals.spti" = pvals.spti$pvals.spti, "pvals.inttt" = pvals.inttt$pvals.inttt, "pvals.intall1" = pvals.intall1$pvals.intall1, "pvals.intall2" = pvals.intall2$pvals.intall2)  
+
+#Write to file
+write.csv(PPV_VSD_corrected2, file="VSDandPVALS_ALL_corrected2.csv", quote=F) #writing an output file of vsd plus p-values
+write.csv(PPV_Norm_corrected2, file="NormCtsandPVALS_ALL_corrected2.csv", quote=F) #
+
+```
+
+```{r venn diagram}
+df_dds<-data.frame(PPV_VSD_corrected2)
+df_dds<-read.csv("VSDandPVALS_ALL_corrected2.csv"); rownames(df_vds)<-df_vds$X
+rownames(df_dds)<-rownames(df_vds)
+
+inttt_dds<-row.names(df_dds[df_dds$adjp.intt<=0.05 & !is.na(df_dds$adjp.inttt),])#all rows where adjusted pvalue is less than or equal to 0.05 and is not an NA
+
+intall1_dds<-row.names(df_dds[df_dds$adjp.intall1<=0.05 & !is.na(df_dds$adjp.intall1),])#all rows where adjusted pvalue is less than or equal to 0.05 and is not an NA
+
+intall2_dds<-row.names(df_dds[df_dds$adjp.intall2<=0.05 & !is.na(df_dds$adjp.intall2),])#all rows where adjusted pvalue is less than or equal to 0.05 and is not an NA
+
+sptr_dds<-row.names(df_dds[df_dds$adjp.sptr<=0.05 & !is.na(df_dds$adjp.sptr),])
+
+spti_dds<- row.names(df_dds[df_dds$adjp.spti<=0.05 & !is.na(df_dds$adjp.spti),])
+
+species_dds<-row.names(df_dds[df_dds$adjp.sp<=0.05 & !is.na(df_dds$adjp.sp),])
+  
+time_dds<-row.names(df_dds[df_dds$adjp.ti<=0.05 & !is.na(df_dds$adjp.ti),])
+
+treat_dds<-row.names(df_dds[df_dds$adjp.tr<=0.05 & !is.na(df_dds$adjp.tr),])
+
+none_dds<-c("sq3","sq7")
+
+#none_dds<-c("sq22","sq23","sq46","sq60","sq75","sq78","sq83","sq84","sq94","sq100","sq101","sq107","sq109","sq111","sq120","sq130","sq139","sq153","sq158","sq160","sq171","sq172","sq184","sq185","sq204","sq205","sq212","sq218","sq220","sq230","sq240","sq248","sq286","sq305","sq340","sq347","sq354","sq362","sq382","sq384","sq390","sq447","sq462","sq472","sq535","sq537","sq547") #old, but in case of needing to edit didn't want to delete all 'sq's
+
+candidates_dds<-list("Treatment"=treat_dds, "Time"=time_dds, "Species"=species_dds,"Species*Treatment"=sptr_dds, "Species*Time"=spti_dds, "Species*Treatment*Time"=intall2_dds)
+
+library(gplots)
+windows()
+venn(candidates_dds)
+3#Capture group counts (without plot)
+venn<-venn(candidates_dds, show.plot=FALSE)
+#Determine which are within different intersections
+venn_intersect<-venn(candidates_dds, intersection=TRUE)
+insect<-attr(venn_intersect, "intersection")
+write.csv(insect,"venninterect.csv", row.names= )
+
+
+inttt_dds
+intall1_dds
+intall2_dds
+#[1] "sq6"   "sq14"  "sq27"  "sq44"  "sq48"  "sq51"  "sq56"  "sq59"  "sq61"  "sq63"  "sq64"  "sq68"  "sq87" 
+#[14] "sq90"  "sq96"  "sq167"
+treat_dds
+#[1] "sq4"   "sq5"   "sq6"   "sq8"   "sq9"   "sq10"  "sq12"  "sq13"  "sq14"  "sq17"  "sq20"  "sq21"  "sq22" 
+#[14] "sq23"  "sq27"  "sq31"  "sq32"  "sq33"  "sq34"  "sq35"  "sq39"  "sq42"  "sq43"  "sq44"  "sq45"  "sq47" 
+#[27] "sq48"  "sq49"  "sq51"  "sq53"  "sq55"  "sq56"  "sq59"  "sq61"  "sq62"  "sq63"  "sq64"  "sq68"  "sq69" 
+#[40] "sq72"  "sq74"  "sq77"  "sq81"  "sq82"  "sq85"  "sq87"  "sq90"  "sq93"  "sq132" "sq167" "sq447"
+time_dds
+#[1] "sq11"  "sq15"  "sq16"  "sq17"  "sq18"  "sq23"  "sq29"  "sq30"  "sq36"  "sq38"  "sq40"  "sq44"  "sq46" 
+#[14] "sq50"  "sq52"  "sq54"  "sq57"  "sq65"  "sq66"  "sq67"  "sq70"  "sq71"  "sq73"  "sq79"  "sq83"  "sq84" 
+#[27] "sq86"  "sq100" "sq105" "sq107" "sq171"
+species_dds
+# [1] "sq4"   "sq9"   "sq10"  "sq11"  "sq12"  "sq15"  "sq16"  "sq17"  "sq18"  "sq20"  "sq22"  "sq23"  "sq29" 
+#[14] "sq30"  "sq31"  "sq32"  "sq33"  "sq34"  "sq35"  "sq36"  "sq38"  "sq39"  "sq40"  "sq41"  "sq42"  "sq44" 
+#[27] "sq46"  "sq50"  "sq52"  "sq53"  "sq54"  "sq57"  "sq66"  "sq67"  "sq70"  "sq71"  "sq73"  "sq74"  "sq77" 
+#[40] "sq79"  "sq80"  "sq81"  "sq82"  "sq86"  "sq89"  "sq100" "sq105" "sq107" "sq171"
+sptr_dds
+# [1] "sq1"   "sq2"   "sq4"   "sq10"  "sq11"  "sq15"  "sq16"  "sq17"  "sq18"  "sq19"  "sq23"  "sq29"  "sq30" 
+#[14] "sq31"  "sq33"  "sq35"  "sq36"  "sq38"  "sq39"  "sq40"  "sq41"  "sq44"  "sq45"  "sq46"  "sq49"  "sq50" 
+#[27] "sq52"  "sq53"  "sq54"  "sq57"  "sq65"  "sq66"  "sq67"  "sq70"  "sq71"  "sq73"  "sq79"  "sq80"  "sq81" 
+#[40] "sq83"  "sq84"  "sq86"  "sq89"  "sq100" "sq101" "sq105" "sq107" "sq109" "sq171"
+spti_dds
+# [1] "sq6"   "sq10"  "sq11"  "sq12"  "sq13"  "sq14"  "sq16"  "sq18"  "sq20"  "sq22"  "sq23"  "sq27"  "sq29" 
+#[14] "sq30"  "sq31"  "sq32"  "sq33"  "sq34"  "sq38"  "sq39"  "sq42"  "sq43"  "sq44"  "sq45"  "sq47"  "sq48" 
+#[27] "sq50"  "sq51"  "sq53"  "sq55"  "sq61"  "sq72"  "sq74"  "sq77"  "sq80"  "sq81"  "sq89"  "sq96"  "sq117"
+#[40] "sq447" "sq482"
+none_dds
+#[1] "sq3" "sq7"
+```
+
+```{r exploring correlations between sig ASVs}
+#purging under-sequenced samples; and ASVs represented less than 1  unique times
+
+goods_dds1=purgeOutliers(dat,count.columns=2:789,zero.cut = 0.25)
+#OTUs passing frequency cutoff of 0.001: 49
+#OTUs with counts in 0.25 samples: 
+#FALSE =36
+#TRUE = 13
+#No samples z-score less than -2.5, 
+
+#USED THIS ONE
+goods_dds2=purgeOutliers(dat,count.columns=2:789,sampleZcut=(-2.5), otu.cut=0.001, zero.cut=0.25)
+#OTUs with counts in 0.001 samples: 49, no samples with z-score below -2.5
+#OTUs passing frequency cutoff of 0.001: 49
+# OTUs with counts in 0.25 samples: 
+#FALSE =36
+#TRUE = 13
+#No samples z-score less than -2.5,
+
+#Measure unique samples (only in 1 treatment)
+goodsUnique=purgeOutliers(dat,count.columns = 2:789, otu.cut = 0.001,zero.cut = 0.007)
+colnames(goodsUnique)[colnames(goodsUnique)=="cdat"]<-"Samplename"
+#OTUs with counts in 1 samples: True: 49
+get_taxa_unique(ps2,"Class")
+
+# creating a log-transformed normalized dataset ignoring zero counts:
+nl=startedLog(data=goods_dds2,count.columns=c(2:14),logstart=0)
+
+panel.cor.pval2<-function (x, y, digits = 2, cex.cor, p.cut = 1) 
+{
+    usr <- par("usr")
+    on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- cor.test(x, y, use = "na.or.complete")$p.value
+    txt <- format(c(r, 0.123456789), digits = digits)[1]
+    if (missing(cex.cor)) 
+        cex.cor <- 0.8/strwidth(txt)
+    if (r > p.cut) {
+        txt = ""
+    }
+    text(0.5, 0.5, txt)
+}
+
+#displaying a matrix of scatterplots and p-values of ASV correlations
+#(onlu p-values better than 0.1 are displayed)
+pairs(nl,lower.panel=panel.smooth,upper.panel=panel.cor.pval2)
+
+pvals=c(0.00054, 0.00055, 0.0018, 0.019, 0.006, 0.0055, 0.0093, 0.038, 0.038, 1.0e-06, 3.7e-07, 0.016, 0.0002, 0.02, 3.7e-12, 1.0e-06, 0.00017, 0.028, 0.049, 0.0021, 0.0053, 0.00069, 0.01, 0.01, 0.019, 0.014)
+p.adjust(pvals,method="BH")
+
+pairs(nl,lower.panel=panel.smooth,upper.panel=panel.cor) 
+
+#Make frame for just treat sig's (based on pval)
+goods_dds_sig_treat=goods_dds2[,c(5:12)] #sq4, sq6, sq10, sq12, sq13, sq14, sq20, sq21
+
+#Make frame for just species sig's
+goods_dds_sig_sp=goods_dds2[,c(5,7,8,11,13,14)] #sq4, sq10, sq12, sq20, sq31, sq32
+
+#frame for species*time sig's
+goods_dds_sig_spti=goods_dds2[,c(6,7,8,9,10,11,13,14)]#sq6, sq10, sq12, sq13, sq14, sq20, sq31, sq32
+
+#frame for species*trea sig's
+goods_dds_sig_sptr=goods_dds2[,c(2,3,5,7,13)]#sq1, sq2, sq4, sq10, sq31
+
+#frame for interaction species*time*treat
+goods_dds_sig_intall2=goods_dds2[,c(6,10)]#sq6, sq14
+
+
+#frame for all sig's
+goods_dds_sig_ALL=goods_dds2[,c(2:14)]
+
+#Creating sample:sample in small batches
+
+
+#sq's for treatment
+nl_dds_treat=startedLog(data=goods_dds_sig_treat,count.columns=(1:8),logstart=0)
+pairs_treat<-pairs(nl_dds_treat,lower.panel=panel.smooth,upper.panel=panel.cor.pval2)
+
+#sq's for species*treatment
+nl_dds_sptr=startedLog(data=goods_dds_sig_sptr,count.columns=(1:5),logstart=0)
+pairs_sptr<-pairs(nl_dds_sptr,lower.panel=panel.smooth,upper.panel=panel.cor.pval2)
+
+#sq's for species*time
+nl_dds_spti=startedLog(data=goods_dds_sig_spti,count.columns=(1:8),logstart=0)
+pairs_sptr<-pairs(nl_dds_spti,lower.panel=panel.smooth,upper.panel=panel.cor.pval2)
+
+#sq's for species*treatment*time
+nl_dds_intall2=startedLog(data=goods_dds_sig_intall2,count.columns=(1:2),logstart=0)
+pairs_sptr<-pairs(nl_dds_intall2,lower.panel=panel.smooth,upper.panel=panel.cor.pval2)
+
+#sq's for species
+nl_dds_sp=startedLog(data=goods_dds_sig_sp,count.columns=(1:6),logstart=0)
+pairs_sp<-pairs(nl_dds_sp,lower.panel=panel.smooth,upper.panel=panel.cor.pval2)
+
+
+
+
+#Look at those of interest
+
+nl_dds_ALL=startedLog(data=goods_dds_sig_ALL,count.columns=(1:13),logstart=0)#Same as Treatment (some sq's overlapped)
+pairs_ALL<-pairs(nl_dds_ALL,lower.panel=panel.smooth,upper.panel=panel.cor.pval2)
+
+#rerun lines 273-296 and 365-383 above if need be to regenerate dat and ps
+#rename taxa (going back to phyloseq object)
+
+
+#Try phyloseq PCoA step here...or nmds?
+
+#subset to significant ASVs (see DESeq analysis below with MCMC pre-filter step, Venn diagram)
+
+#Subset to significant ASVs
+allsigASV<-c("sq1", "sq2","sq3",  "sq4",  "sq6",  "sq10", "sq12","sq13", "sq14", "sq20", "sq21", "sq31", "sq32")
+
+SigASV<-prune_taxa(taxa_names(ps2) %in% allsigASV, ps2)
+
+#establish sample order for plotting
+
+SamSortY<-rownames(sample_data(SigASV)[order(sample_data(SigASV)$Treatment,sample_data(SigASV)$TimePoint,sample_data(SigASV)$Species),])
+SamSortA<-rownames(sample_data(SigASV)[order(sample_data(SigASV)$Treatment,sample_data(SigASV)$TimePoint),])
+
+#Comeback
+#plot a sample heatmap
+theme_set(theme_bw())
+plot_heatmap(SigASV,method=NULL,sample.order=SamSortA,taxa.order=rev(all))
+
+
+
+
+#BarPlot
+p<-read.csv("NormCtsandPVALS_ALL_corrected.csv"); rownames(p)<-p$X
+normDat<-as.data.frame(t(p[,2:136]))
+head(normDat)
+rownames(normDat)<-rownames(otu_table(ps2))
+
+#replace phyloseq ASV table with normalized counts
+OTU<-otu_table(normDat,taxa_are_rows=FALSE)
+otu_table(ps2)<-OTU
+
+#subset to significant ASVs (see DESeq analysis below with MCMC pre-filter step, Venn diagram)
+
+allsigASV<-c("sq1", "sq2","sq3",  "sq4",  "sq6",  "sq10", "sq12","sq13", "sq14", "sq20", "sq21", "sq31", "sq32")
+
+SigASV<-prune_taxa(taxa_names(ps2) %in% allsigASV, ps2)
+
+otus<-rownames(tax_table(SigASV))
+
+# over-write the former kingdom slot in the tax table with the functional group
+tax_table(SigASV)[,"Kingdom"] <- otus
+
+
+plot_bar(SigASV,fill="Kingdom")+labs(fill='SeqVars')
+
+
+#Those which ended up being significant following phylo tree setup
+goods_dds_sig_tree=goods_dds1
+
+nl_dds_tree=startedLog(data=goods_dds_sig_tree,count.columns=(2:14),logstart=0)
+
+pairs_tree<-pairs(nl_dds_tree,lower.panel=panel.smooth,upper.panel=panel.cor.pval2)
+```
+
+```{r Carl Plot}
+##Plot a CarlPlot: VSD values
+
+p<-read.csv("VSDandPVALS_ALL_corrected.csv"); rownames(p)<-p$X #approximates log2 transform
+normDat<-as.data.frame(t(p[,2:136]))
+
+head(normDat)
+rownames(normDat)<-rownames(otu_table(ps2))
+
+#replace phyloseq ASV table with normalized counts
+OTU<-otu_table(normDat,taxa_are_rows=FALSE)
+otu_table(ps2)<-OTU
+
+#subset to significant ASVs (see DESeq analysis below with MCMC pre-filter step, Venn diagram)
+
+allsigASV<-c("sq1", "sq2","sq3",  "sq4",  "sq6",  "sq10", "sq12","sq13", "sq14", "sq20", "sq21", "sq31", "sq32")
+
+SigASV<-prune_taxa(taxa_names(ps2) %in% allsigASV, ps2)
+
+otus<-rownames(tax_table(SigASV))
+
+# over-write the former kingdom slot in the tax table with the functional group
+tax_table(SigASV)[,"Kingdom"] <- otus
+
+dfSig<-psmelt(SigASV)
+dfSig$Species<-factor(dfSig$Species,levels=c("A. millepora","G. retiformis"))
+head(df)
+
+
+#source("summarySE.R")
+
+sp<-subset(dfSig,Kingdom=="sq4"|Kingdom=="sq10"|Kingdom=="sq12"|Kingdom=="sq20"|Kingdom=="sq31"|Kingdom=="sq32")
+tr<-subset(dfSig,Kingdom=="sq4"|Kingdom=="sq6"|Kingdom=="sq10"|Kingdom=="sq12"|Kingdom=="sq13"|Kingdom=="sq14"|Kingdom=="sq20"|Kingdom=="sq21"|Kingdom=="sq31"|Kingdom=="sq32")
+int<-subset(dfSig,Kingdom=="sq6"|Kingdom=="sq14")
+intsptr<-subset(dfSig,Kingdom=="sq1"|Kingdom=="sq2"|Kingdom=="sq4"|Kingdom=="sq10"|Kingdom=="sq31")
+intspti<-subset(dfSig,Kingdom=="sq6"|Kingdom=="sq12"|Kingdom=="sq13"|Kingdom=="sq14"|Kingdom=="sq20"|Kingdom=="sq31"|Kingdom=="sq32")
+
+
+#Carl Plots of all significant
+all.summ=summarySE(dfSig,measurevar="Abundance",groupvars=c("OTU","TimePoint","Treatment","Species"))
+
+pd <- position_dodge(.3)
+cbp2 <- c("#000000", "#E69F00", "#56B4E9", "#009E73",
+          "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+#Plotted by Species*Time point
+ggplot(all.summ,aes(x=Treatment,y=Abundance))+
+	geom_point(aes(group=Species,pch=Species),position=pd,size=2.5)+
+	geom_errorbar(aes(ymin=Abundance-se,ymax=Abundance+se),lwd=0.4,width=0.3,position=pd)+
+	geom_line(aes(group=Species,linetype=Species),position=pd)+
+  scale_fill_manual(values=c("lightblue","deepskyblue")) +
+	facet_wrap(~OTU,scales="free_y",ncol=5)
+
+#Plotted by Species*Time point
+ggplot(all.summ,aes(x=TimePoint,y=Abundance))+
+	geom_point(aes(group=Species,pch=Species),position=pd,size=2.5)+
+	geom_errorbar(aes(ymin=Abundance-se,ymax=Abundance+se),lwd=0.4,width=0.3,position=pd)+
+	geom_line(aes(group=Species,linetype=Species),position=pd)+
+  scale_fill_manual(values=c("lightblue","deepskyblue")) +
+	facet_wrap(~OTU+Treatment,scales="free_y",ncol=9)
+
+#Plotted by Species*Treatment
+ggplot(all.summ,aes(x=Treatment,y=Abundance,fill=TimePoint))+
+	geom_point(aes(group=Species,pch=Species),position=pd,size=2.5)+
+	geom_errorbar(aes(ymin=Abundance-se,ymax=Abundance+se),lwd=0.4,width=0.3,position=pd)+
+	geom_line(aes(group=Species,linetype=Species),position=pd)+
+	scale_color_manual(values=c("lightblue","deepskyblue"))+
+	facet_wrap(~OTU+Species,scales="free_y",ncol=8)+
+	theme_bw()
+
+
+#Species-specific sigs
+all.summ=summarySE(sp,measurevar="Abundance",groupvars=c("OTU","Species"))
+
+ggplot(all.summ,aes(x=Species,y=Abundance))+
+	geom_point(aes(),position=pd,size=2.5)+
+	geom_errorbar(aes(ymin=Abundance-se,ymax=Abundance+se),lwd=0.4,width=0.3,position=pd)+
+	geom_line(aes(),position=pd)+
+	#scale_fill_manual(values=c("lightblue","deepskyblue"))+
+	facet_wrap(~OTU,scales="free_y",ncol=8)+
+	theme_bw()
+
+#Treatment-Specific sigs
+all.summ=summarySE(tr,measurevar="Abundance",groupvars=c("OTU","Treatment", "TimePoint"))
+pd <- position_dodge(.3)
+ggplot(all.summ,aes(x=TimePoint,y=Abundance))+
+	geom_point(aes(),position=pd,size=2.5)+
+	geom_errorbar(aes(ymin=Abundance-se,ymax=Abundance+se),lwd=0.4,width=0.3,position=pd)+
+	geom_line(aes(),position=pd)+
+	#scale_fill_manual(values=c("lightblue","deepskyblue"))+
+	facet_wrap(~OTU,scales="free_y",ncol=5)+
+	theme_bw()
+```
+
+```{r Relationships among sig ASVs and Phylo Tree}
+library(pegas)
+library(phangorn)
+library(seqinr)
+
+
+#D types
+input <- "Dvars_ForClustal_WithGeoSymBioRef.fasta"
+d <- ape::read.dna(input, format='fasta')
+e <- dist.dna(d)
+h <- pegas::haplotype(d, labels=c("sq1","sq2, (D1, D1a GenBank)","sq3","sq4","sq6","sq10","sq12","sq13", "sq14", "sq20","sq21","sq31","sq32","D1a.1 GenBank","D5 GenBank","D5 GeoSymBio","D6 GeoSymBio","D1 GeoSymBio","D1a GeoSymBio","D1.1 GeoSymBio"))
+
+h <- sort(h, what = "label")
+(net <- pegas::haploNet(h))
+ind.hap<-with(
+stack(setNames(attr(h, "index"), rownames(h))),
+table(hap=ind, pop=rownames(d)[values])
+)
+
+plot(net, size=c(1,1,1), scale.ratio=1,cex=1, pie=ind.hap,fast=TRUE)
+legend("topright", colnames(ind.hap), ncol=6, col=rainbow(ncol(ind.hap)), pch=19, cex = .6)
+
+
+plot(net, size=c(0.5,0.5,1), scale.ratio=2,cex=0.8, pie=ind.hap,fast=TRUE)
+legend("topright", colnames(ind.hap), col=rainbow(ncol(ind.hap)), pch=19, ncol=2,cex = 0.75)
+
+
+#plot phylogenetic tree
+input <- "Dvars_ForClustal_WithGeoSymBioRef.fasta"
+d <- ape::read.dna(input, format='fasta')
+d_phyDat<-phyDat(d,type="DNA",levels=NULL) #convert sequence data to phyDat object
+
+dna_dist<-dist.ml(d_phyDat) #build tree with distance based methods
+seqs_UPGMA<-upgma(dna_dist)
+seqs_NJ<-NJ(dna_dist)
+plot(seqs_UPGMA)
+plot(seqs_NJ)
+
+mt<-modelTest(d_phyDat)
+print(mt)
+write.csv(mt, "modeltestingTree.csv")
+
+fit_phylo<-pml(seqs_UPGMA,d_phyDat)
+
+#HKY - Winner with lowest AIC + G (Gamma)
+fitHKY<-optim.pml(fit_phylo,model="HKY",optInv=FALSE,optGamma=FALSE,rearrangement="NNI",control=pml.control(trace=0)) 
+bs <- bootstrap.pml(fitHKY,bs=100,optNni=TRUE,control=pml.control(trace=0))
+plotBS(fitHKY$tree, bs, p=50, type="p")
+
+#GTR
+fitGTR<-optim.pml(fit_phylo,model="GTR",optInv=FALSE,optGamma=FALSE,rearrangement="NNI",control=pml.control(trace=0)) 
+bs2 <- bootstrap.pml(fitGTR,bs=100,optNni=TRUE,control=pml.control(trace=0))
+plotBS(fitGTR$tree, bs2, p=50, type="p")
+
+#F81
+fitF81<-optim.pml(fit_phylo,model="F81",optInv=FALSE,optGamma=FALSE,rearrangement="NNI",control=pml.control(trace=0)) 
+bs3 <- bootstrap.pml(fitF81,bs=100,optNni=TRUE,control=pml.control(trace=0))
+plotBS(fitF81$tree, bs3, p=50, type="p")
+```
+
+```{r abundant taxa}
+###########################
+###Most Abundant taxa######
+###########################
+library(reshape2)
+find.top.taxa <- function(ps,taxa){
+  require(phyloseq)
+  top.taxa <- tax_glom(ps, taxa)
+  otu <- otu_table(top.taxa) # remove the transformation if using a merge_sample object
+  tax <- tax_table(top.taxa)
+  j<-apply(otu,1,which.max)
+  k <- j[!duplicated(j)]
+  l <- data.frame(tax[k,])
+  m <- data.frame(otu[,k])
+  s <- as.name(taxa)
+  colnames(m) = l[,taxa]
+  n <- colnames(m)[apply(m,1,which.max)]
+  m[,taxa] <- n
+  return(m)
+}
+find.top.taxa(ps,"Phylum")
+TopTypes<-find.top.taxa(ps, "Class")
+
+write.csv(TopTypes, file = "TopTypesClassAmil.csv")
+TopTypes<-read.csv("TopTypesClassAmil.csv")
+
+#Compare All
+TopTypesMelt<-melt(TopTypes, id.vars=c("Treatment","TimePoint","Species"),measure.vars = c("D1", "C1m", "D1a"))
+TopTypesMelt %>% group_by(Treatment)
+TopTypesMelt %>% group_by(TimePoint)
+TopTypesMelt %>% group_by(Species)
+#boxplot of ASV counts for each type
+TopTypesMelt %>%
+  ggplot(aes(x=Species, y=value, fill=variable)) +
+  geom_boxplot() +
+  xlab("Time Point")+
+  ylab("ASV Read Adundance") +
+  labs(fill="Type")+
+  facet_wrap(~Treatment+TimePoint,ncol=3)+
+  theme(axis.text.x = element_text(angle=45, hjust =1)) +
+  theme_bw()
+#boxplot of ASV counts for each type
+TopTypesMelt %>%
+  ggplot(aes(x=Species, y=value, fill=variable)) +
+  geom_boxplot() +
+  xlab("Time Point")+
+  ylab("ASV Read Adundance") +
+  labs(fill="Type")+
+  facet_wrap(~Treatment,ncol=3)+
+  theme(axis.text.x = element_text(angle=45, hjust =1)) +
+  theme_bw()
+#Create ps with counts but only important sqs
+ps3<-ps2
+OTU3<-otu_table(goods2[2:153],taxa_are_rows=FALSE)
+sample_names(OTU3)<-sample_names(OTU)
+otu_table(ps3)<-OTU3
+
+#otu_table(ps2)<-OTU
+#List of number of total classes matched to the ASV groups
+ClassTableps<-table(tax_table(ps)[,"Class"])
+
+#number of ASVs per sample
+asv_df<-t(otu_table(ps3))
+NoASVsSam=colSums(asv_df !=0)
+NoSamASVs=rowSums(asv_df !=0)
+
+mergedTreatment = merge_samples(ps3, "Treatment")
+sample_names(mergedTreatment)
+
+
+genfac = factor(tax_table(ps3)[,"Class"])
+gentab = apply(otu_table(ps3), MARGIN = 1, function(x) {
+  tapply(x, INDEX =genfac, FUN = sum, na.rm = TRUE, simplify = TRUE)
+})
+head(gentab)[,1:10]
+write.csv(gentab, "AllASVsSamplesAmilli3.csv")
+```
+
+```{r microbiome}
+library(BiocManager)
+BiocManager::install("microbiome")
+library(microbiome)
+#Copy ps data
+psvar<-prune_samples(sample_data(ps)$sample.name %in% goods2$cdat, ps) #raw counts but filtered samples
+
+#information on groups and setup
+summarize_phyloseq(psvar)
+readcount<-readcount(psvar) #read counts
+readcount[1:135] #print number of reads in samples 1-135
+meta<-meta(psvar)
+tax<-tax_table(psvar)
+head(sample_names(psvar)) #sample names
+sum<-sample_sums(psvar) #total ASV abundance in each sample
+sample_variables(psvar)
+ntaxa<-ntaxa(psvar) #number taxa
+
+#Relative abundances
+varabund<-abundances(psvar, "compositional") #relative abundance (compositional)
+pseq.rel<- microbiome::transform(psvar, 'compositional')
+
+#Absolute abundance
+varabsolute<-abundances(ps2)
+head(varabund)
+
+#Create phyloseq with relative abundance as otu_table (psrel)
+psrel<-psvar
+tvar<-t(varabund)
+otu_table(psrel)<-otu_table(tvar, taxa_are_rows = FALSE)
+#taxanames<-taxa[,3]
+#taxa_names(psrel)<-taxanames
+
+
+
+#create list of top 11 types
+vartop<-aggregate_top_taxa(psrel, top=12, level="Class")
+
+#List of top 39 (Or the number filtered as good)
+vartop<-aggregate_top_taxa(pseq.rel, top=11, level="Class")
+
+#Diversity 
+varalpha<-alpha(psvar, index="shannon")
+vartopalpha<-alpha(vartop, index="shannon")
+sample_data(psvar)$diversity<-varalpha #assign diversity measures to sample data
+sample_data(vartop)$diversity<-vartopalpha
+
+#Join ASV table and Tax in one dataframe
+asv_tab<-as.data.frame(abundances(vartop)) #get ASVs
+asv_tab$asv_id<-rownames(asv_tab)#new column for ids
+tax_tab<-as.data.frame(tax_table(vartop)) #get taxonomy
+tax_tab<-as(vartop@tax_table,"matrix") #taxonomy note as matrix
+tax_tab <- as.data.frame(tax_tab) # convert to data frame
+tax_tab$asv_id <- rownames(tax_tab) # add a new column for ids
+asv_tax_tab <- tax_tab %>% 
+  left_join(asv_tab, by="asv_id")
+head(asv_tax_tab)[,1:8]
+
+#Core microbiome
+library(devtools)
+
+#prevalence of tax groups, relative at 1% compositional abundance threshold
+head(prevalence(ps2, detection = 1/100, sort = TRUE))
+#Taxa that exceed given threshold
+core.taxa.standard <- core_members(ps2, detection = 0, prevalence = 50/100)
+#We can also collapse the rare taxa into an “Other” category
+pseq.core <- aggregate_rare(ps2, "Class", detection = 0, prevalence = .5)
+#Total core abundance in each sample (sum of each core member)
+core.abundance <- sample_sums(core(ps2, detection = .01, prevalence = .95))
+
+#Composition barplot - Types
+library(hrbrthemes)
+library(gcookbook)
+library(tidyverse)
+theme_set(theme_bw(21))
+p <- vartop %>%
+    plot_composition(otu.sort = "abundance") +
+         # Set custom colors
+          scale_fill_manual(values = default_colors("Phylum")[taxa(psrel)]) +
+      scale_y_continuous(label = scales::percent)
+
+#Specify sample groups
+
+p <- plot_composition(vartop,
+              taxonomic.level = "Class",
+                      sample.sort = "Species",
+                      x.label ="Species" ) +
+     guides(fill = guide_legend(ncol = 1)) +
+     scale_y_percent() +
+     labs(x = "Samples", y = "Relative abundance (%)",
+                                   title = "Relative abundance data",
+                                   subtitle = "Subtitle",
+                                   caption = "Caption text.") + 
+     theme_ipsum(grid="Y")
+
+
+p <- plot_composition(vartop, fill="Class")
+p <- p + facet_wrap(~Species)
+
+# Averaged by group
+p <- plot_composition(vartop,
+                      average_by = "Treatment") + facet_grid(~TimePoint+Species, scales="free_x") + labs (x="Clade", fill="Type")
+print(p)
+print(p)
+
+#Relative abundance plot
+p.rel <- plot_composition(vartop, sample.sort = NULL, otu.sort = NULL,
+  x.label = "empo_3", plot.type = "barplot", verbose = FALSE)
+
+print(p.rel)
+
+p <- p + facet_wrap(~Treatment+TimePoint+Species, scales = "free_x", nrow=3)
+
+
+#Barplot by Clade
+pclade <- vartop<-aggregate_top_taxa(pseq.rel, top=6, level="Phylum")
+
+#Specify sample groups
+p <- plot_composition(pclade,
+              taxonomic.level = "Class",
+                      sample.sort = "Species",
+                      x.label ="Species" ) +
+     guides(fill = guide_legend(ncol = 1)) +
+     scale_y_percent() +
+     labs(x = "Samples", y = "Relative abundance (%)",
+                                   title = "Relative abundance data",
+                                   subtitle = "Subtitle",
+                                   caption = "Caption text.") + 
+     theme_ipsum(grid="Y")
+
+# Averaged by group
+p <- plot_composition(pclade,average_by = "Treatment") 
+
+#Relative abundance plot
+p.rel <- plot_composition(pclade, sample.sort = NULL, otu.sort = NULL,
+  x.label = "empo_3", plot.type = "barplot", verbose = FALSE)
+
+print(p.rel)
+
+p <- p.rel + facet_wrap(~Treatment+TimePoint+Species, scales = "free_x", nrow=3)
+
+
+
+dfSig<-psmelt(SigASV)
+dfSig$Species<-factor(dfSig$Species,levels=c("A. millepora","G. retiformis"))
+head(df)
+
+
+```
+
+```{r Shannon}
+library("phyloseq")
+library("ggplot2")
+library("dplyr")
+library("ggpubr")
+
+#Arrange metadata factors so groups are listed in given order
+richness<-estimate_richness(p2)
+
+```
+
+```{r DESeq2} 
+dds<-DESeqDataSetFromMatrix(countData=counts, 
+                              colData=conditions, design = ~Treatment + Species + Treatment:Species + Treatment:TimePoint)
+dds
+
+dds<-DESeq(dds)
+```
+
+
+```{r Figures}
+#Shannon Diversity
+#Treatment
+sample_data(psrel)$Treatment <- factor((sample_data(psrel)$Treatment), levels=c("2020","2050","2100"))
+
+DivPlot<-plot_richness(ps2, x="Treatment", measures="Shannon", color = "TimePoint")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="right", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))
+
+
+#Time Point
+sample_data(psrel)$TimePoint <- factor((sample_data(psrel)$TimePoint), levels=c("T0","T1","T2"))
+
+plot_richness(psrel, x="TimePoint", measures="Shannon", color = "Treatment")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="right", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))
+
+#Species
+sample_data(psrel)$Species <- factor((sample_data(psrel)$Species), levels=c("A. millepora","G. retiformis"))
+
+plot_richness(psrel, x="Species", measures="Shannon", color = "Species")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="right", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))
+```
+
+```{r Significant Diversity Anova}
+#Run anova test to check if variables impact diversity
+#Treatment
+anova.sh=aov(richness$Shannon~sample_data(ps2)$Treatment)
+summary(anova.sh) #not sig
+#Time
+anova.time=aov(richness$Shannon~sample_data(ps2)$TimePoint)
+summary(anova.time) #significant
+#Species
+anova.sp=aov(richness$Shannon~sample_data(ps2)$Species)
+summary(anova.sp) #significant
+```
+
+```{r patchwork}
+library(patchwork)
+#install.package("imager")
+library(imager)
+#Panel A: Rel Abundance
+RelAb<-load.image("C:/Users/alyxt/Documents/Minor Project/All2/AllData/Figures")
+#Panel B: Diversity
+DivPlot<-plot_richness(psrel, x="Species", measures="Shannon", color = "Treatment")+
+  geom_boxplot(alpha=0.6)+ 
+  theme(legend.position="right", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))
+#Panel C:
+
+```
