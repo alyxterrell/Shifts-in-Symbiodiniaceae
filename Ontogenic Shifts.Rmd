@@ -424,46 +424,124 @@ plot_richness(ps2, x="TimePoint", measures="Shannon", color = "Species")+
   stat_compare_means(method = "wilcox.test", comparisons = c_my_comparisons, label = "p.signif", symnum.args = symnum.args)
 
 
-#Histogram to measure for distribution
+#Create richness dataset for Shannon index analyses
 richness<-estimate_richness(ps2, measures = "Shannon")
-hist(richness$Shannon, main = "Shannon Index", xlab = "") #It is
 
 
-#Run anova test to check if variables impact diversity
-#Treatment
-anova.sh=aov(richness$Shannon~sample_data(ps2)$Treatment)
-summary(anova.sh) # sig
-#Time
-anova.time=aov(richness$Shannon~sample_data(ps2)$TimePoint)
-summary(anova.time) #significant
-#Species
-anova.sp=aov(richness$Shannon~sample_data(ps2)$Species)
-summary(anova.sp) #significant
+##########################################################################
+##################### SHANNON DIVERSITY INDEX - STATS ####################
+##########################################################################
+### To test differences in diversity across time points (T0, T1, T2) and treatments (Ambient, 2050, 2100) in A. millepora and G. retiformis, 3 separate analyses were run: 1. diversity in A. millepora across treatments 2. Diversity in G. retiformis across time and treatments 3. Diversity in A. millepora and G. retiformis across treaments at T2.
 
-#Tukey to test for differences
-TukeyHSD(anova.time) #T1-T0 and T2-T1
-TukeyHSD(anova.sp)
-TukeyHSD(anova.sh) #2100-2020 and 2100-2050
+ 
+#loading libraries for alpha diversity analyses
+library(DHARMa)
+library(lmerTest)
+library(multcomp)
+library (ggplot2)
+
+#using Shannon_Richness_metadata.csv: richness dataset with metadata manually included (time, treatment, species, tank)
+Shannon_data = read.csv("Shannon_Richness_metadata.csv", sep = ',',  dec = ".", check.names = FALSE, row.names=1)
+Shannon_data$Time <- factor(Shannon_data$Time) #Time as factor
+Shannon_data$Treatment <- factor(Shannon_data$Treatment) #Treatment as factor
+Shannon_data$Species <- factor(Shannon_data$Species) #Species as factor
+Shannon_data$Tank <- factor(Shannon_data$Tank) #Tank as factor
+dim(Shannon_data) #to check if data have been imported correctly 
+str(Shannon_data) #Check structure of the dataset
+View(Shannon_data) #to view data
+
+###############################################
+######### Shannon index: A. millepora #########
+###############################################
+#only Acropora
+Shannon_data_Acropora <- subset (Shannon_data, Species == "Acropora")
+
+#model within Acropora
+model_Shannon_Acropora <- lmer(sqrt(Shannon) ~ Treatment + (1|Tank), data = Shannon_data_Acropora) #random intercept model #lmer uses RMEL
+anova(model_Shannon_Acropora) #NO sign
+
+#checking assumptions (normality, homogeneity, linearity)
+simulationOutput <- simulateResiduals(fittedModel = model_Shannon_Acropora, plot = T) 
+fligner.test(sqrt(Shannon)  ~ interaction(Treatment), data=Shannon_data_Acropora) 
+shapiro.test (resid(model_Shannon_Acropora)) 
+qqnorm (resid(model_Shannon_Acropora))
+qqline (resid(model_Shannon_Acropora)) 
+hist(resid(model_Shannon_Acropora)) 
+ggplot(data.frame(x1=Shannon_data_Acropora$Treatment,pearson=residuals(model_Shannon_Acropora,type="pearson")),
+       aes(x=Shannon_data_Acropora$Treatment,y=pearson)) +
+  geom_point() +
+  theme_bw() #linearity
+#both normality and homogeneity met when data are sqrt transformed
+
+################################################
+######### Shannon index: G. retiformis #########
+################################################
+#only Goaniastrea
+Shannon_data_Goniastrea <- subset (Shannon_data, Species == "Goniastrea")
+
+#model within Goniastrea
+model_Shannon_Goniastrea <- lmer(Shannon ~ Treatment*Time + (1|Tank), data = Shannon_data_Goniastrea)
+anova (model_Shannon_Goniastrea) #Time sign
+
+#checking model assumptions (normality, homogeneity, linearity)
+simulationOutput <- simulateResiduals(fittedModel = model_Shannon_Goniastrea, plot = T) 
+fligner.test(Shannon  ~ interaction(Treatment, Time), data=Shannon_data_Goniastrea) 
+shapiro.test (resid(model_Shannon_Goniastrea)) 
+qqnorm (resid(model_Shannon_Goniastrea))
+qqline (resid(model_Shannon_Goniastrea)) 
+hist(resid(model_Shannon_Goniastrea))
+ggplot(data.frame(x1=Shannon_data_Goniastrea$Time,pearson=residuals(model_Shannon_Goniastrea,type="pearson")),
+       aes(x=Shannon_data_Goniastrea$Time,y=pearson)) +
+  geom_point() +
+  theme_bw() #linearity
+ggplot(data.frame(x1=Shannon_data_Goniastrea$Treatment,pearson=residuals(model_Shannon_Goniastrea,type="pearson")),
+       aes(x=Shannon_data_Goniastrea$Treatment,y=pearson)) +
+  geom_point() +
+  theme_bw() #linearity
+#assumptions met
+
+#pairwise comparisons
+hgtSampleType<- glht(model_Shannon_Goniastrea, linfct=mcp(Time="Tukey"))
+summary(hgtSampleType,test = adjusted("BH")) #T1 different to T2
 
 
-##Now again with relative abundance
+####################################################################
+######### Shannon index: A. millepora and G. retiformis T2 #########
+####################################################################
+#only T2
+Shannon_data_T2 <- subset (Shannon_data, Time == "T2")
 
-richnessrel<-estimate_richness(psrel, measures = "Shannon")
-hist(richness$Shannon, main = "Shannon Index", xlab = "") #It is
+#model both species
+model_Shannon_species <- lmer(Shannon ~ Species*Treatment + (1|Tank), data = Shannon_data_T2)
+anova(model_Shannon_species) #Species and Species*treatment sign
 
-#Run anova test to check if variables impact diversity
-#Treatment
-anova.relsh=aov(richnessrel$Shannon~sample_data(psrel)$Treatment)
-summary(anova.relsh) #not sig
-#Time
-anova.reltime=aov(richnessrel$Shannon~sample_data(psrel)$TimePoint)
-summary(anova.reltime) #significant
-#Species
-anova.relsp=aov(richnessrel$Shannon~sample_data(psrel)$Species)
-summary(anova.relsp) #significant
+#checking model assumptions (normality, homogeneity, linearity)
+simulationOutput <- simulateResiduals(fittedModel = model_Shannon_species, plot = T) 
+fligner.test(Shannon  ~ interaction(Species, Treatment), data=Shannon_data_T2) 
+shapiro.test (resid(model_Shannon_species)) 
+qqnorm (resid(model_Shannon_species))
+qqline (resid(model_Shannon_species)) 
+hist(resid(model_Shannon_species))
+ggplot(data.frame(x1=Shannon_data_T2$Treatment,pearson=residuals(model_Shannon_species,type="pearson")),
+       aes(x=Shannon_data_T2$Treatment,y=pearson)) +
+  geom_point() +
+  theme_bw() #linearity
+ggplot(data.frame(x1=Shannon_data_T2$Species,pearson=residuals(model_Shannon_species,type="pearson")),
+       aes(x=Shannon_data_T2$Species,y=pearson)) +
+  geom_point() +
+  theme_bw() #linearity
+#assumptions met
 
-#Tukey to test for differences
-TukeyHSD(anova.reltime) #T1-T0 and T2-T1, not T2-T0
+#pairwise comparisons
+Shannon_data_T2$SpeciesTreatment <-interaction(Shannon_data_T2$Species, Shannon_data_T2$Treatment)
+model_Shannon_species <- lmer(Shannon ~ SpeciesTreatment + (1|Tank), data = Shannon_data_T2)
+hgt<- glht(model_Shannon_species, linfct=mcp(SpeciesTreatment="Tukey"))
+summary(hgt,test = adjusted("BH")) #sign differences in diversity between species under 2100 conditions
+
+#####################################################################################
+#####################################################################################
+#####################################################################################
+
 
 ####Merged samples by Treatment###
 psmerge=merge_samples(ps2, "Treatment")
@@ -1574,19 +1652,6 @@ sample_data(psrel)$Species <- factor((sample_data(psrel)$Species), levels=c("A. 
 plot_richness(psrel, x="Species", measures="Shannon", color = "Species")+
   geom_boxplot(alpha=0.6)+ 
   theme(legend.position="right", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))
-```
-
-```{r Significant Diversity Anova}
-#Run anova test to check if variables impact diversity
-#Treatment
-anova.sh=aov(richness$Shannon~sample_data(ps2)$Treatment)
-summary(anova.sh) #not sig
-#Time
-anova.time=aov(richness$Shannon~sample_data(ps2)$TimePoint)
-summary(anova.time) #significant
-#Species
-anova.sp=aov(richness$Shannon~sample_data(ps2)$Species)
-summary(anova.sp) #significant
 ```
 
 ```{r patchwork}
